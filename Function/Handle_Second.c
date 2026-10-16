@@ -2,9 +2,12 @@
  * Handle_Second —— ① 机械臂舵机调试 ② USART3 接收(占位, 暂未启用)
  *
  * 【本文件有两块内容】
- *   ① 机械臂舵机调试 Arm_Test_BaseSweep() —— 见文件末尾"机械臂舵机调试层"。
- *      这是当前在用的部分: 上电只让最下面那一路舵机(底座回转)来回扫描,
- *      用来肉眼确定"零度"对应的机械姿态。
+ *   ① 机械臂舵机调试 —— 见文件末尾两个调试层, 由 Handle_Second.h 里的
+ *      ARM_TEST_MODE 选择:
+ *        Arm_Test_BaseSweep()  上电只让最下面那一路舵机(底座回转)来回扫描,
+ *                              用来肉眼确定"零度"对应的机械姿态;
+ *        Arm_OutputCheck()      不动舵机, 只把 5 路的 mem/ccr/引脚实测波形
+ *                              显示出来, 用来对账"示波器读数 vs 代码"。
  *   ② USART3 字节接收 —— 占位代码, 暂未启用, 说明见下。
  *
  * ------------------------------------------------------------
@@ -103,7 +106,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
  *   来回扫描, 眼睛盯着看, 把"零度"对应的机械姿态确定下来:
  *
  *       脉宽  500us = 软件   0°   <- 行程的一端, 这就是要找的"零度姿态"
- *       脉宽 1500us = 中位  90°   <- Servo_Init() 的默认位置
+ *       脉宽 1500us = 中位  90°   <- Servo_Init() 的上电脉宽表里填的值
  *       脉宽 2500us = 软件 180°   <- 行程的另一端
  *
  *   (MG996R 是 180° 舵机, 行程 500~2500us, 1° = 11.11us, 换算见 servo.c)
@@ -180,8 +183,9 @@ static const uint16_t s_arm_sig_pin[SERVO_NUM] =
 };
 
 /**
-  * @brief  内部: 采样本路舵机信号脚的高电平占比(%), 证明 PWM 到底有没有
+  * @brief  内部: 采集某一路舵机信号脚的高电平占比(%), 证明 PWM 到底有没有
   *         真的从引脚输出出去
+  * @param  id  舵机 ID (SERVO_ID1 ~ SERVO_ID5)
   * @retval 高电平占整个采样窗口的百分比(0~100)
   * @note   原理: 信号脚配成定时器复用输出后, 读它的输入寄存器(如
   *         GPIOE->IDR)拿到的仍然是引脚上的真实电平。用一个紧密循环连续
@@ -197,15 +201,15 @@ static const uint16_t s_arm_sig_pin[SERVO_NUM] =
   *         读回 100% -> 引脚恒高;
   *         读回 2% / 7% / 13% 且随脉宽变化 -> PWM 正常, 问题在舵机/供电/机械。
   */
-static uint8_t arm_test_pin_duty(void)
+static uint8_t arm_pin_duty(uint8_t id)
 {
     uint32_t i;
     uint32_t hi   = 0u;
     /* 采样窗口取足够大, 保证即使循环跑得最快也远超一个 20ms 的 PWM 周期,
      * 否则窗口可能整个落在脉冲之外, 读出假的 0%。 */
     uint32_t all  = 2000000u;
-    GPIO_TypeDef *port = s_arm_sig_port[ARM_TEST_ID];
-    uint16_t      pin  = s_arm_sig_pin[ARM_TEST_ID];
+    GPIO_TypeDef *port = s_arm_sig_port[id];
+    uint16_t      pin  = s_arm_sig_pin[id];
 
     /* 采样期间只屏蔽 TIM3 中断: 它每 20ms 进一次(里面要读 I2C, 耗时长且
      * 不固定), 和 20ms 的 PWM 周期同频, 不屏蔽就会在固定相位上漏采样,
@@ -236,7 +240,7 @@ static uint8_t arm_test_pin_duty(void)
   */
 static void arm_test_show(uint16_t pulse_us, float angle_deg, const char *state)
 {
-    uint8_t duty = arm_test_pin_duty();     /* 先测, 再画 */
+    uint8_t duty = arm_pin_duty(ARM_TEST_ID);   /* 先测, 再画 */
 
     OLED_ClearBuffer();     /* 只清显存, 不刷屏; 下面统一 Refresh() 一次 */
 
@@ -342,5 +346,272 @@ void Arm_Test_BaseSweep(void)
         HAL_Delay(ARM_TEST_END_DWELL_MS);
 
         arm_test_ramp(ARM_TEST_PULSE_MAX, ARM_TEST_PULSE_MIN);
+    }
+}
+
+/* ============================================================
+ * 舵机输出对账层 —— 给"示波器量到的占空比/周期和代码算的对不上"用
+ *
+ * 【为什么要单独做这一层】
+ *   外部仪器量 50Hz / 1.5ms 这种窄脉冲时很容易受触发、阈值、探头接地的影响,
+ *   而"舵机到底被命令到了哪个角度"只由引脚上真实的高电平时间决定。
+ *   这里一次给出三份证据, 三者一对照就知道断在哪一环:
+ *       ① 软件侧: 缓存脉宽 mem、比较寄存器 ccr、通道使能位 CCxE
+ *       ② 引脚侧: 实测高电平时间 H、周期 T、高电平占比(片上示波器,
+ *                 用内核 DWT 周期计数器当基准, 与定时器无关)
+ *       ③ 定时器侧: ARR / PSC 以及由实测周期换算出的"1 个计数 = 多少 us"
+ *
+ *   判读:
+ *     - "NO PULSE ON PIN" 或 sam 0%  -> 这一路根本没输出 PWM
+ *       (CCxE = NO / Servo_Init() 没跑到 / 引脚没配成复用);
+ *     - duty 和 set 对不上  -> "写的"和"输出的"不是一回事(引脚没动/被外部拉死);
+ *     - tick 不是 1.00us、T 不是 20000  -> 定时器时钟或预分频和预期不符,
+ *       舵机收到的脉宽(us)会跟着变, 占空比自然也变;
+ *     - duty 与 set 一致  -> 硬件输出正常, 问题在舵机/供电/机械。
+ *
+ * 【安全】本层只读不写: 不碰任何舵机寄存器, 机械臂保持 Servo_Init() 摆好的
+ *   姿态不动, 所以接在 Servo_Init() 后面看是安全的。
+ * ============================================================ */
+
+/* 采样超时(ms): 20ms 的周期留 5 倍余量, 引脚上没有跳变时也能及时退出 */
+#define ARM_PULSE_TIMEOUT_MS    100u
+
+/* 每一路的停留时间(ms): 单次占空比采样本身要跑 200 万次循环(约 0.1s) */
+#define ARM_CHECK_DWELL_MS      2000u
+
+/* 等电平跳变的"循环次数"保险: 5,000,000 次约 240ms, 详见 arm_wait_level() */
+#define ARM_WAIT_GUARD_MAX      5000000u
+
+/**
+  * @brief  内部: 启动 DWT 周期计数器(Cortex-M4 内核自带)
+  * @note   168MHz 主频下 1 个计数 = 1/168us, 量 1.5ms / 20ms 这种量级绰绰有余。
+  *         它和定时器无关, 所以即使定时器时钟配错, 它给出的仍是真实时间 ——
+  *         这正是用来判断"定时器 1 个计数是不是真的 1us"的基准。
+  */
+static void arm_dwt_start(void)
+{
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;     /* 打开跟踪单元 */
+    DWT->CYCCNT = 0u;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;                /* 周期计数开始跑 */
+}
+
+/**
+  * @brief  内部: 等引脚变成指定电平, 返回跳变时刻的 DWT 计数值
+  * @param  port         GPIO 端口
+  * @param  pin          引脚位
+  * @param  want_high    1 = 等高电平, 0 = 等低电平
+  * @param  timeout_cyc  超时(内核周期数)
+  * @param  t_edge       输出: 电平变成 want_high 时的 DWT->CYCCNT
+  * @retval 1 = 等到了; 0 = 超时(引脚没有这个跳变)
+  * @note   除 DWT 超时外还加了一道"循环次数"保险: 万一 DWT 周期计数器没跑
+  *         (计数值恒为 0, 时间差永远是 0, DWT 超时永远不会触发), 只靠 DWT
+  *         判断会在这里死等、把调试界面卡住。等最长的合法情况是要等近
+  *         20ms 的下一个上升沿, 约 42 万次循环, 所以 500 万次留了 12 倍余量。
+  */
+static uint8_t arm_wait_level(GPIO_TypeDef *port, uint16_t pin,
+                              uint32_t want_high, uint32_t timeout_cyc,
+                              uint32_t *t_edge)
+{
+    uint32_t t0    = DWT->CYCCNT;
+    uint32_t guard = 0u;
+
+    while (((port->IDR & pin) != 0u) != (want_high != 0u))
+    {
+        if (((DWT->CYCCNT - t0) > timeout_cyc) || (++guard > ARM_WAIT_GUARD_MAX))
+        {
+            return 0u;
+        }
+    }
+
+    *t_edge = DWT->CYCCNT;
+    return 1u;
+}
+
+/**
+  * @brief  内部: 直接在信号脚上量"高电平时间"和"周期"(片上示波器)
+  * @param  id         舵机 ID
+  * @param  high_us    输出: 高电平时间(微秒)
+  * @param  period_us  输出: 周期(微秒)
+  * @retval 1 = 量到了; 0 = 引脚上没有跳变(恒低 / 恒高 / 无输出)
+  * @note   信号脚配成定时器复用输出后, 读它的输入寄存器拿到的仍是引脚真实
+  *         电平, 所以不用拆线、不用外接示波器就能知道舵机实际收到什么。
+  *         ★ 采样期间屏蔽 TIM3 中断: 它 20ms 进一次(里面要读 I2C, 耗时且不
+  *           固定), 和 PWM 周期同频, 不屏蔽会漏采样、把时间量歪。这里不关
+  *           全局中断, SysTick 照常走, HAL_GetTick() 不受影响。
+  */
+static uint8_t arm_pin_pulse(uint8_t id, uint32_t *high_us, uint32_t *period_us)
+{
+    GPIO_TypeDef *port = s_arm_sig_port[id];
+    uint16_t      pin  = s_arm_sig_pin[id];
+    uint32_t      cyc_per_us = SystemCoreClock / 1000000u;
+    uint32_t      cyc_per_ms = SystemCoreClock / 1000u;
+    /* 超时的单位是"毫秒 -> 内核周期数"。★ 别漏掉 1000: 低电平要一直持续到
+     * 下个周期的上升沿(50Hz 下最坏近 20ms), 只给 100us 会必然超时,
+     * 把"明明有 PWM"误判成 NO PULSE ON PIN。 */
+    uint32_t      timeout    = ARM_PULSE_TIMEOUT_MS * cyc_per_ms;
+    uint32_t      t0 = 0u, t1 = 0u, t2 = 0u;
+    uint8_t       ok;
+
+    HAL_NVIC_DisableIRQ(TIM3_IRQn);
+
+    ok  = arm_wait_level(port, pin, 0u, timeout, &t0);  /* 先落在低电平上 */
+    ok &= arm_wait_level(port, pin, 1u, timeout, &t0);  /* 上升沿 = 脉冲起点 */
+    ok &= arm_wait_level(port, pin, 0u, timeout, &t1);  /* 下降沿 = 脉冲终点 */
+    ok &= arm_wait_level(port, pin, 1u, timeout, &t2);  /* 下一个上升沿 = 周期终点 */
+
+    HAL_NVIC_EnableIRQ(TIM3_IRQn);
+
+    if (ok == 0u)
+    {
+        return 0u;
+    }
+
+    *high_us   = (t1 - t0) / cyc_per_us;    /* 无符号差值, 计数器回绕也正确 */
+    *period_us = (t2 - t0) / cyc_per_us;
+    return 1u;
+}
+
+/**
+  * @brief  内部: 取该路通道使能位(CCxE)在 CCER 里的掩码
+  * @param  id  舵机 ID
+  * @retval CCER 中的掩码
+  * @note   ID1~ID4 = TIM4_CH1~CH4 -> CC1E/CC2E/CC3E/CC4E; ID5 = TIM9_CH1 -> CC1E。
+  *         CH1 的掩码是 0x0001, 每往后一个通道左移 4 位, 正好 (id & 3) * 4 位
+  *         —— ID5(=4) & 3 = 0, 落在 CC1E 上, 两种定时器都算对。
+  */
+static uint32_t arm_ccer_mask(uint8_t id)
+{
+    return (uint32_t)(1u << (((uint32_t)id & 3u) * 4u));
+}
+
+/**
+  * @brief  舵机输出对账: 5 路轮流显示"软件写了什么"和"引脚上实际是什么"
+  * @note   ★ 只读不写, 不动任何舵机; 机械臂保持 Servo_Init() 摆好的姿态。
+  *         ★ 内部是死循环, 调用后不会返回 —— 放在 main() 初始化段的最后;
+  *           看完把 Handle_Second.h 里的 ARM_TEST_MODE 改回 OFF 再重新编译。
+  *
+  *         屏幕判读(每一路一屏, 每 2 秒换下一路):
+  *           mem        软件缓存的脉宽(us)        -> Servo_GetPulseUs()
+  *           ccr        比较寄存器里的真值(us)    -> 与 mem 一致才说明写进了硬件
+  *           EN / NO    通道使能位(CCxE)开没开    -> NO = 这一路根本没启动
+  *           H / T      引脚实测高电平时间 / 周期 -> 舵机真正收到的波形
+  *           tick       实测周期 /(ARR+1), 即 1 个计数等于多少 us
+  *           sam        200 万次引脚电平采样出的占空比(%), 不依赖 DWT, 可互为佐证
+  *           duty       引脚实测占空比(%) = H/T, 两位小数, 直接和示波器读数对比
+  *           set        软件设定占空比(%) = ccr/(ARR+1), 两位小数
+  *           ch X/5     进度提示
+  *
+  *         判读:
+  *           duty 与 set 一致           -> 硬件输出正常, 问题在舵机/供电/机械;
+  *           duty≈0 但 set 正常         -> 引脚根本没动(没配成复用 / 被外部拉死);
+  *           NO PULSE ON PIN 且 sam 0%  -> 这一路没有 PWM 输出;
+  *           tick 不是 1.00us、T 不是 20000 -> 定时器时钟或预分频与预期不符,
+  *           此时舵机收到的脉宽(us)也跟着变, 占空比自然对不上。
+  */
+void Arm_OutputCheck(void)
+{
+    uint8_t  id;
+    uint8_t  duty;
+    uint16_t mem;
+    uint32_t ccr, arr, psc, en, sig;
+    uint32_t high_us, period_us, tick100;
+    float    duty_pin, duty_set;
+
+    arm_dwt_start();
+
+    for (;;)
+    {
+        for (id = 0u; id < SERVO_NUM; id++)
+        {
+            TIM_TypeDef *tim = (id == SERVO_ID5) ? htim9.Instance : htim4.Instance;
+
+            mem = Servo_GetPulseUs(id);
+            ccr = Servo_GetCcr(id);
+            arr = tim->ARR;
+            psc = tim->PSC;
+            en  = ((tim->CCER & arm_ccer_mask(id)) != 0u) ? 1u : 0u;
+
+            high_us   = 0u;
+            period_us = 0u;
+            tick100   = 0u;
+            duty_pin  = 0.0f;
+            duty_set  = 0.0f;
+
+            sig  = (uint32_t)arm_pin_pulse(id, &high_us, &period_us);
+            duty = arm_pin_duty(id);
+
+            /* 设定占空比: 比较值 / 周期, 单位 %(定时器本身就是按这个比值输出的) */
+            if ((arr + 1u) != 0u)
+            {
+                duty_set = (float)ccr * 100.0f / (float)(arr + 1u);
+            }
+
+            if (sig != 0u)
+            {
+                /* 1 个定时器计数 = 多少 us(乘 100 保留两位小数) */
+                tick100 = (period_us * 100u) / (arr + 1u);
+
+                if (period_us != 0u)
+                {
+                    /* 实测占空比: 引脚上量到的高电平时间 / 周期 */
+                    duty_pin = (float)high_us * 100.0f / (float)period_us;
+                }
+            }
+
+            OLED_ClearBuffer();
+            OLED_ShowString(0, 0, "SERVO OUT CHECK");
+            OLED_ShowString(0, 1, s_arm_joint_name[id]);
+
+            OLED_ShowString(0, 2, "mem");
+            OLED_ShowNum(18, 2, (int32_t)mem, 4);
+            OLED_ShowString(42, 2, "ccr");
+            OLED_ShowNum(60, 2, (int32_t)ccr, 4);
+            OLED_ShowString(84, 2, (en != 0u) ? "EN" : "NO");
+
+            if (sig != 0u)
+            {
+                OLED_ShowString(0, 3, "H");
+                OLED_ShowNum(6, 3, (int32_t)high_us, 5);
+                OLED_ShowString(36, 3, "us T");
+                OLED_ShowNum(60, 3, (int32_t)period_us, 5);
+                OLED_ShowString(90, 3, "us");
+
+                OLED_ShowString(0, 4, "tick");
+                OLED_ShowFloat(24, 4, (float)tick100 / 100.0f, 2);
+                OLED_ShowString(60, 4, "us sam");
+                OLED_ShowNum(96, 4, (int32_t)duty, 2);
+                OLED_ShowString(108, 4, "%");
+            }
+            else
+            {
+                OLED_ShowString(0, 3, "NO PULSE ON PIN");
+                OLED_ShowString(6, 4, "sam");
+                OLED_ShowNum(24, 4, (int32_t)duty, 2);
+                OLED_ShowString(36, 4, "%  no edge");
+            }
+
+            OLED_ShowString(0, 5, "ARR");
+            OLED_ShowNum(18, 5, (int32_t)arr, 5);
+            OLED_ShowString(48, 5, "PSC");
+            OLED_ShowNum(66, 5, (int32_t)psc, 3);
+
+            /* 占空比大小: duty = 引脚实测(H/T 算出来的); set = 软件设定
+             * (ccr/ARR 算出来的)。两个数应该一致 —— 不一致就说明"写的"和
+             * "输出的"不是一回事, 对着示波器的读数一眼就能看出差在哪。 */
+            OLED_ShowString(0, 6, "duty");
+            OLED_ShowFloat(24, 6, duty_pin, 2);
+            OLED_ShowString(60, 6, "%");
+            OLED_ShowString(78, 6, "ch");
+            OLED_ShowNum(90, 6, (int32_t)(id + 1u), 1);
+            OLED_ShowString(96, 6, "/5");
+
+            OLED_ShowString(0, 7, "set");
+            OLED_ShowFloat(18, 7, duty_set, 2);
+            OLED_ShowString(54, 7, "%");
+
+            OLED_Refresh();
+
+            HAL_Delay(ARM_CHECK_DWELL_MS);
+        }
     }
 }

@@ -45,3 +45,4 @@ fish\main.o: ../Hardware/OLED.h
 fish\main.o: ../Hardware/key.h
 fish\main.o: ../Hardware/Menu.h
 fish\main.o: ../Hardware/wireless_uart.h
+fish\main.o: ../Hardware/servo.h

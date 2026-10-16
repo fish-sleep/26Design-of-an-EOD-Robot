@@ -22,11 +22,12 @@
 
 /* 【上电自检模式】
  * ★ 标定完、正式跑车之前, 记得改回 ARM_TEST_MODE_OFF,
- *   否则程序会一直卡在扫描里。 */
+ *   否则程序会一直卡在自检里(两个自检函数内部都是死循环)。 */
 #define ARM_TEST_MODE_OFF       0   /* 不自检, 走正常流程 */
-#define ARM_TEST_MODE_BASE      1   /* 底座舵机扫描: 找零度用 */
+#define ARM_TEST_MODE_BASE      1   /* 底座舵机扫描: 找零度用(会让舵机一直转) */
+#define ARM_TEST_MODE_OUTPUT    2   /* 输出对账: 不动舵机, 只量 5 路的实际输出 */
 
-#define ARM_TEST_MODE           ARM_TEST_MODE_BASE
+#define ARM_TEST_MODE           ARM_TEST_MODE_OUTPUT
 
 /* ------------------------------------------------ */
 
@@ -43,6 +44,37 @@
  * ★ 只有 ID5 这一路会得到脉冲, 另外 4 路保持不输出(松的), 台架上最安全。
  * ⚠ 想看第二遍: 重新上电或按复位, 不需要按键。 */
 void Arm_Test_BaseSweep(void);
+
+/* 【舵机输出对账】不动任何舵机, 只把"软件写了什么"和"引脚上实际是什么"
+ * 逐路显示在 OLED 上(5 路轮流, 每 2 秒换一路), 用来排查
+ * "示波器量到的占空比/周期和代码算的对不上":
+ *
+ *   行0  SERVO OUT CHECK                标题
+ *   行1  ID4 FOLD2  PD15                当前这一路
+ *   行2  mem1500 ccr1500  EN            mem = 软件缓存的脉宽;
+ *                                       ccr = 比较寄存器真值;
+ *                                       EN/NO = 通道使能位(CCxE)是否打开
+ *   行3  H1500us   T20000us             引脚实测高电平时间 / 周期
+ *                                       (NO PULSE ON PIN = 引脚上没有跳变)
+ *   行4  tick1.00us sam7%              tick = 实测周期/(ARR+1), 即 1 个计数
+ *                                       等于多少 us; sam = 200 万次引脚电平
+ *                                       采样出的占空比(不依赖 DWT, 可互为佐证)
+ *   行5  ARR19999 PSC83                 定时器寄存器实际值
+ *   行6  duty7.50%   ch4/5              duty = 引脚实测占空比(%) = H/T, 两位小数
+ *   行7  set7.50%                       set = 软件设定占空比(%) = ccr/(ARR+1)
+ *
+ * 判读:
+ *   - "NO PULSE ON PIN" 或 sam 0%  -> 这一路根本没输出 PWM
+ *     (CCxE = NO / Servo_Init() 没跑到 / 引脚没配成复用);
+ *   - tick 不是 1.00us、T 不是 20000 -> 定时器时钟或预分频与预期不符,
+ *     舵机拿到的脉宽(us)跟着变, 占空比自然对不上;
+ *   - duty 与 set 一致             -> 硬件输出正常, 问题在舵机/供电/机械;
+ *   - duty≈0 但 set 正常           -> 引脚根本没动(没配成复用 / 被外部拉死)。
+ *
+ * ★ 只读不写, 机械臂保持 Servo_Init() 摆好的姿态, 接在 Servo_Init() 后面安全。
+ * ★ 内部是死循环, 调用后不会返回 —— 放在 main() 初始化段的最后;
+ *   用完把 ARM_TEST_MODE 改回 ARM_TEST_MODE_OFF。 */
+void Arm_OutputCheck(void);
 
 /* ---------------- ② USART3(占位) ---------------- */
 

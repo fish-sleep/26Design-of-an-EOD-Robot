@@ -33,6 +33,7 @@
 #include "key.h"
 #include "Menu.h"
 #include "wireless_uart.h"
+#include "servo.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -139,10 +140,6 @@ int main(void)
   }
   else
   {
-    /* 模块正常: 把回传率从出厂 10Hz 提到 50Hz。
-     * 必须提 —— 出厂 10Hz 是 100ms 才更新一次角度, 而定时器 20ms 就跑一次
-     * PD, 中间几次都在重复算同一个旧数据, 响应会明显滞后、容易振荡。
-     * 该设置写进模块后断电不丢失, 只需生效一次。 */
     JY901S_SetOutputRate(JY901S_RRATE_50HZ);
   }
 
@@ -155,19 +152,20 @@ int main(void)
   Menu_Init();
   /* 初始化无线串口上报(VOFA+ 波形), 只复位内部计时 */
   Wireless_Init();
-  /* 初始化航向角 PD 闭环模块(Function/Handle_One.c):
-   * 复位闭环状态 + 把 SysTick 优先级提到 TIM3 之上 + 启动 TIM3 更新中断
-   * (20ms 一次)。中断取数、PD 运算、下发逻辑都在那个文件里。
-   * ★ 不加这句, TIM3 中断永远不会进来, 姿态数据也不会刷新。 */
+  /* 初始化舵机: 5 路按 servo.c 里 s_servo_power_on_pulse[] 给的脉宽直接输出 */
+  Servo_Init();
+
+#if (ARM_TEST_MODE == ARM_TEST_MODE_OUTPUT)
+  /* 舵机输出对账(调试用): 不动舵机, 只把 5 路的 mem/ccr/引脚实测波形打到
+   * OLED 上, 用来和示波器读数对账。★ 内部是死循环 —— 看完把 Handle_Second.h
+   * 里的 ARM_TEST_MODE 改回 ARM_TEST_MODE_OFF 再重新编译。 */
+  Arm_OutputCheck();
+#endif
+	
+	
+  /* 初始化航向角 PD 闭环模块*/
   Handle_One_Init();
 
-  /* ★ 舵机自检(临时): 只让最下面那一路(ID5 底座回转 / PE5)上电自动来回扫描,
-   * 用来肉眼确定"零度"对应的机械姿态。开关在 Function/Handle_Second.h 的
-   * ARM_TEST_MODE —— 标定完改成 ARM_TEST_MODE_OFF 即可恢复正常流程。
-   * ⚠ 这是阻塞调用, 不会返回, 所以放在初始化的最后一步。 */
-#if (ARM_TEST_MODE == ARM_TEST_MODE_BASE)
-  Arm_Test_BaseSweep();
-#endif
 
   /* USER CODE END 2 */
 

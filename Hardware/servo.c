@@ -16,10 +16,15 @@
  *   所以 1 个计数 = 1us, CCR 的值直接就是脉宽的微秒数。
  *
  * 【上电顺序】
- *   先给每个通道写好比较值(中位), 再 HAL_TIM_PWM_Start()。
+ *   先给每个通道写好比较值, 再 HAL_TIM_PWM_Start()。
  *   如果反过来的话, 上电瞬间会先按 CubeMX 里的初值输出
  *   (TIM9_CH1 和 TIM4_CH4 的初值是 0, 也就是 0% 占空比、完全没有脉冲),
  *   舵机会先松垮一下再到位。
+ *
+ * 【上电姿态】
+ *   Servo_Init() 不摆固定中位, 也不做角度换算, 而是把下面那张
+ *   s_servo_power_on_pulse[] 表里的脉宽(us)直接写进 CCR(限幅后) ——
+ *   想改上电第一帧的姿态, 只改那张脉宽表即可。
  * ============================================================ */
 
 #include "main.h"
@@ -147,26 +152,64 @@ static void servo_write(uint8_t id, uint16_t pulse_us)
                           (uint32_t)pulse_us);
 }
 
+/* ---- 上电初始脉宽表(单位: 微秒 us) ----
+ * 每次上电/复位后, Servo_Init() 把这张表里的脉宽**直接**写进定时器比较寄存器
+ * (CCR) —— 不经过任何角度换算, 给多少就是多少: 屏幕上/示波器上量到的高电平
+ * 时间就等于这里的值。想改上电第一帧的机械臂姿态, 只改这张表。
+ *
+ * 数组下标就是舵机 ID (SERVO_ID1 ~ SERVO_ID5):
+ *     [0] ID1 -> PD12  夹爪
+ *     [1] ID2 -> PD13  腕旋转
+ *     [2] ID3 -> PD14  折叠①(小臂)
+ *     [3] ID4 -> PD15  折叠②(大臂)
+ *     [4] ID5 -> PE5   底座回转
+ *
+ * 常用值(500~2500us 的 180° 舵机, 50Hz 时):
+ *      500us =   0° =  2.5% 占空比
+ *     1500us =  90° =  7.5% 占空比   <- 中位, 也是复位后的默认值
+ *     2500us = 180° = 12.5% 占空比
+ *
+ * 说明:
+ *   - 超出该路 s_servo_cal[] 的 pulse_min/pulse_max 会被限幅(保护舵机),
+ *     除此之外不做任何转换;
+ *   - 这里给的是"装到机械臂上以后"的脉宽: 该路 dir = -1 也不会被翻转,
+ *     表里写多少就输出多少(要多走一点就自己把数加大);
+ *   - 需要按角度来控制时用 Servo_SetAngle()/Servo_SetPulseUs(), 两套并存,
+ *     本表只负责上电那一下。 */
+static const uint16_t s_servo_power_on_pulse[SERVO_NUM] =
+{
+    2500u,      /* ID1 -> PD12  夹爪     (180° / 12.5%) */
+    2500u,      /* ID2 -> PD13  腕旋转   (180° / 12.5%) */
+    1500u,      /* ID3 -> PD14  折叠①    ( 90° /  7.5%) */
+    1500u,      /* ID4 -> PD15  折叠②    ( 90° /  7.5%) */
+    1500u       /* ID5 -> PE5   底座回转 ( 90° /  7.5%) */
+};
+
 /**
   * @brief  初始化舵机
   * @note   上电调用一次。
-  *         先把 5 路都设成中位再启动 PWM, 避免上电时舵机猛地弹一下。
+  *         把 s_servo_power_on_pulse[] 里的脉宽限幅后直接写进比较寄存器(CCR),
+  *         再启动 PWM —— 不经过角度换算, 给多少 us 就输出多少 us。
+  *         ★ 顺序不能反: 先写 CCR 再启动, 否则会先输出一帧 CubeMX 里的初值
+  *           (0% 占空比), 舵机会先松垮一下再到位。
+  *         写入后顺带更新角度缓存, 保证 Servo_GetAngle() 读到的值和当前
+  *         脉宽一致(只是显示/读取用, 不参与这次的输出)。
   */
 void Servo_Init(void)
 {
-    uint8_t i;
+    uint8_t  i;
+    uint16_t pulse;
 
     for (i = 0; i < SERVO_NUM; i++)
     {
-        s_servo_angle[i] = SERVO_ANGLE_MID;
-        s_servo_pulse[i] = servo_limit_pulse(i, servo_angle_to_pulse(i, SERVO_ANGLE_MID));
+        /* 1. 脉宽限幅后直接写进 CCR(servo_write 内部就是 __HAL_TIM_SET_COMPARE) */
+        pulse = servo_limit_pulse(i, s_servo_power_on_pulse[i]);
+        servo_write(i, pulse);
 
-        /* 1. 先设好比较值 */
-        __HAL_TIM_SET_COMPARE(s_servo_hw[i].htim,
-                              s_servo_hw[i].channel,
-                              (uint32_t)s_servo_pulse[i]);
+        /* 角度缓存跟着对一下, 免得 Servo_GetAngle() 读到和脉宽对不上的旧值 */
+        s_servo_angle[i] = servo_pulse_to_angle(i, pulse);
 
-        /* 2. 再启动 PWM 输出 */
+        /* 2. 再启动 PWM 输出 —— 顺序不能反, 否则会先输出一帧 CubeMX 初值 */
         (void)HAL_TIM_PWM_Start(s_servo_hw[i].htim, s_servo_hw[i].channel);
     }
 }
@@ -174,8 +217,8 @@ void Servo_Init(void)
 /**
   * @brief  只启动某一路舵机的 PWM 输出(其余通道保持不输出)
   * @param  id  舵机 ID (SERVO_ID1 ~ SERVO_ID5)
-  * @note   和 Servo_Init() 的区别: Servo_Init() 一次把 5 路全拉起来并摆在
-  *         中位; 本函数只拉一路, 专门给"单路调试/标定"用 —— 只有被拉起来
+  * @note   和 Servo_Init() 的区别: Servo_Init() 一次把 5 路全拉起来并按上电
+  *         脉宽表输出; 本函数只拉一路, 专门给"单路调试/标定"用 —— 只有被拉起来
   *         的这一路会收到脉冲并保持住, 其它几路仍然是松的, 不会跟着乱动,
   *         台架上最安全, 观察到的动作也只属于这一路。
   *
